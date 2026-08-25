@@ -520,11 +520,19 @@ jobs:
               cp "./flatpak/${N}-${A}.flatpak" dist/
               ;;
             arch)
-              # arm64+arch:上游/CI 均无 aarch64 makepkg,archlinux 步已被 if 跳过 → 无 .zst 产物。
-              # 此处 fail-fast(而非 `|| true` 静默),让 build job 变红、notify 上报 status=error,
-              # 避免产出"只含 custom_.txt 的空 release + file_url 404"却回报 done 的坏链。
-              cp ./res/*.pkg.tar.zst dist/ 2>/dev/null || cp ./res/*.zst dist/ 2>/dev/null \
-                || { echo "::error::无 arch 包产出(arm64+arch 组合 CI 不支持 makepkg;请改用 x86_64 或换 deb/rpm 格式)"; exit 1; }
+              # makepkg-action 在 rustdesk/makepkg 容器里以 build 用户产出到 res/(PKGEXT=.pkg.tar.zst),
+              # 其 entrypoint `chown -R build /github/workspace` 会把 res/ 改属主 → 宿主 runner 用户
+              # 无权列 res/,普通 glob(cp ./res/*.zst)展开失败。故用 sudo find 绕权限定位主包(排除
+              # -debug),sudo cp 出来再 chown 回 runner。arm64+arch 时 archlinux 步已被 if 跳过 → 无包,
+              # find 落空即 fail-fast(不静默产坏 release)。
+              PKG=$(sudo find "$PWD" -name 'rustdesk-*.pkg.tar.zst' ! -name '*-debug-*' 2>/dev/null | head -1)
+              if [ -z "$PKG" ]; then
+                echo "::error::arch 包未找到(x86_64+arch 应由 makepkg 产出;arm64+arch CI 不支持)"
+                sudo find "$PWD" -name '*.pkg.tar*' 2>/dev/null | head; exit 1
+              fi
+              sudo cp "$PKG" "dist/${N}-${A}.pkg.tar.zst"
+              sudo chown "$(id -u):$(id -g)" "dist/${N}-${A}.pkg.tar.zst"
+              echo "arch 包收集: $PKG → dist/${N}-${A}.pkg.tar.zst"
               ;;
           esac
           # custom_.txt 随包发布(客户端注入配置)
@@ -550,7 +558,7 @@ jobs:
             suse)     PRIMARY="${FILENAME}-${{ env.ARCH }}-suse.rpm";;
             appimage) PRIMARY="${FILENAME}-${{ env.ARCH }}.AppImage";;
             flatpak)  PRIMARY="${FILENAME}-${{ env.ARCH }}.flatpak";;
-            arch)     PRIMARY=$(cd dist && ls *.zst 2>/dev/null | head -1);;
+            arch)     PRIMARY="${FILENAME}-${{ env.ARCH }}.pkg.tar.zst";;
             *)        PRIMARY="${FILENAME}-${{ env.ARCH }}.deb";;
           esac
           echo "file_url=${BASE}/${PRIMARY}" >> "$GITHUB_OUTPUT"
