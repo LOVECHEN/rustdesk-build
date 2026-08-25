@@ -417,10 +417,14 @@ jobs:
             done
             ls -l /workspace/output/
 
+            # ── custom_.txt 注入 flutter bundle 根 ────────────────────────────────────────
+            #   deb 经 tmpdeb 烘焙(见上);rpm(fedora/suse)/arch 的 spec/PKGBUILD 都是从
+            #   flutter/build/linux/<x64|arm64>/release/bundle/* 拷进 /usr/share/rustdesk/,
+            #   与 deb 同一运行时目录。把 custom_.txt 落进 bundle 根 → 这些格式一并内置定制配置。
+            if [ "${{ env.ARCH }}" = "aarch64" ]; then BDL=flutter/build/linux/arm64/release/bundle; else BDL=flutter/build/linux/x64/release/bundle; fi
+            if [ -d "$BDL" ]; then cp ./custom_.txt "$BDL/custom_.txt" && echo "custom_.txt → $BDL"; else echo "::warning::bundle 目录缺失,rpm/arch 未内置 custom_.txt: $BDL"; fi
+
             # ── 按 FORMAT 在容器内追加 rpm / suse rpm(rpm 已在 install 步装好)──────────────
-            #   NOTE: custom_.txt 目前仅经 tmpdeb 烘焙进 deb(appimage/flatpak 由 deb 派生故也含);
-            #   rpm/suse/arch 走 flutter bundle 打包,暂未注入 custom_.txt —— 若这些格式也要内置
-            #   custom_.txt,需另把它拷进 spec 引用的 bundle 目录(TODO)。
             FMT="${{ env.FORMAT }}"
             if [ "$FMT" = "fedora" ]; then
               echo "start packaging fedora rpm"
