@@ -19,6 +19,29 @@ on:
         required: false
         type: string
         default: ''
+      # ── rdauth 给所有平台 workflow 统一派发这 4 个 dispatch 输入;本平台(windows)只实际消费 arch/msi。
+      #    distro(linux 包格式)/package_format(android apk/aab)在 windows 用不到,但【必须声明】——
+      #    否则 rdauth 携带该输入 dispatch 时 GitHub 会 422 拒绝(未声明的 input)。
+      arch:
+        description: '(optional) CPU 架构: 空/x64 → x86_64-pc-windows-msvc(现状);x86 → i686-pc-windows-msvc(32位,不出 msi)'
+        required: false
+        type: string
+        default: ''
+      distro:
+        description: '(optional) linux 包格式;windows 不消费,仅为兼容 rdauth 统一派发而声明'
+        required: false
+        type: string
+        default: ''
+      package_format:
+        description: '(optional) android 包格式(apk/aab);windows 不消费,仅为兼容 rdauth 统一派发而声明'
+        required: false
+        type: string
+        default: ''
+      msi:
+        description: "(optional) 是否额外打 msi: 'true' 才打,否则只出 portable exe(x86 强制不打)"
+        required: false
+        type: string
+        default: 'false'
 
 permissions:
   contents: write
@@ -42,20 +65,23 @@ jobs:
     with:
       version: '1.4.9'
 
-  # ── 主编译:windows x64 → portable .exe (+ 可选 .msi) ───────────────────────────────
+  # ── 主编译:windows → portable .exe (+ 可选 .msi) ─────────────────────────────────────
+  #    arch 由 inputs.arch 选:空/'x64' → x86_64-pc-windows-msvc(现状,完全向后兼容);
+  #                            'x86'    → i686-pc-windows-msvc(32位,vcpkg triplet 换 x86-windows-static,不出 msi)。
+  #    matrix.job.arch 仍是产物名后缀(x86_64 / x86),保持既有 filename-<arch>.exe 命名。
   build-windows:
     needs: generate-bridge
-    name: build rustdesk windows x86_64
+    name: build rustdesk windows ${{ inputs.arch == 'x86' && 'x86' || 'x86_64' }}
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
       matrix:
         job:
           - {
-              target: x86_64-pc-windows-msvc,
+              target: "${{ inputs.arch == 'x86' && 'i686-pc-windows-msvc' || 'x86_64-pc-windows-msvc' }}",
               os: windows-2022,
-              arch: x86_64,
-              vcpkg-triplet: x64-windows-static,
+              arch: "${{ inputs.arch == 'x86' && 'x86' || 'x86_64' }}",
+              vcpkg-triplet: "${{ inputs.arch == 'x86' && 'x86-windows-static' || 'x64-windows-static' }}",
             }
     outputs:
       file_url: ${{ steps.release.outputs.file_url }}
@@ -359,11 +385,14 @@ jobs:
           mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/rustdesk.exe"
           ls -l ./SignOutput/
 
-      # ── (可选)WiX 打 msi;best-effort,失败不影响 portable exe 交付 ──
+      # ── (可选)WiX 打 msi;仅当 inputs.msi=='true' 且非 x86 时才打(x86 32位强制不打 msi)。
+      #    默认 msi='false' → 跳过,只出 portable exe。打 msi 仍 best-effort(continue-on-error),失败不影响 exe 交付。
       - name: Add MSBuild to PATH
+        if: ${{ inputs.msi == 'true' && inputs.arch != 'x86' }}
         uses: microsoft/setup-msbuild@v2
 
       - name: Build msi (optional)
+        if: ${{ inputs.msi == 'true' && inputs.arch != 'x86' }}
         continue-on-error: true
         run: |
           $myappname = "${{ env.appname }}" -replace '\s','_'
