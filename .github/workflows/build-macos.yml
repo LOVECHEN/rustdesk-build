@@ -211,7 +211,10 @@ jobs:
 
           # Xcode project settings
           sed -i '' -e 's/PRODUCT_NAME = "RustDesk"/PRODUCT_NAME = "${{ env.appname }}"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
-          sed -i '' -e 's/PRODUCT_BUNDLE_IDENTIFIER = ".*"/PRODUCT_BUNDLE_IDENTIFIER = "${{ env.bundleid }}"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
+          # ★上游 pbxproj 是 `PRODUCT_BUNDLE_IDENTIFIER = com.carriez.rustdesk;`(无引号+分号,且它覆盖 xcconfig)。
+          #   旧 sed 写死 `= ".*"`(要引号)对不上 → 从不替换 → 产物 bundle id 恒为 com.carriez.rustdesk。
+          #   改成匹配到分号(兼容有/无引号)+ /g 覆盖 Debug/Release/Profile 三处(都是主 Runner target,同值)。
+          sed -i '' -e 's/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = ${{ env.bundleid }};/g' ./flutter/macos/Runner.xcodeproj/project.pbxproj
 
           # CMake settings
           if [ -f "./flutter/macos/CMakeLists.txt" ]; then
