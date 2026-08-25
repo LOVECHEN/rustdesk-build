@@ -105,6 +105,21 @@ jobs:
           chmod +x /tmp/patch/*.sh
           /tmp/patch/apply-config.sh "$PWD" "$PWD/config.json"
 
+      #   apply-icons.sh 依赖 ImageMagick(convert/magick)生成 res/icon.ico/各尺寸 png,
+      #   必须在下方 Apply icons 之前装好(ubuntu runner,同 linux)。
+      - name: Install ImageMagick
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+
+      #   把控制台上传的应用图标/首页 Logo(config.json 的 base64)换进源码。
+      #   必须在 Restore resources(补齐上游默认图标)之后跑,才能用自定义图标覆盖上游默认图标。
+      - name: Apply icons
+        run: |
+          set -e
+          bash /tmp/patch/apply-icons.sh "$PWD" "$PWD/config.json"
+
       #   signMode=delete:apply-config 已删验签,直接 base64 即可被客户端接受。
       #   android 侧不 file-read custom_.txt,而是把这段 base64 内嵌进 native(见下方 Embed 步)。
       - name: Generate config blob
@@ -259,6 +274,14 @@ jobs:
         run: |
           cd $(dirname $(dirname $(which flutter)))
           [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      #   从 res/icon.png(apply-icons 已换成自定义图标)重生成 android mipmap 等各平台 flutter 图标;
+      #   pubspec flutter_icons.image_path 指向 ../res/icon.png。best-effort:装不上/跑不通也不阻断构建
+      #   (Rust 侧 res/icon.ico 已给了 exe/托盘图标)。须在 flutter 安装之后、真正 build 之前。
+      - name: Regenerate flutter icons
+        continue-on-error: true
+        run: |
+          cd flutter && flutter pub get && (dart run flutter_launcher_icons || flutter pub run flutter_launcher_icons || true)
 
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
