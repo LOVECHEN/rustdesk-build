@@ -124,6 +124,22 @@ jobs:
           chmod +x /tmp/patch/*.sh 2>/dev/null || true
           bash /tmp/patch/apply-config.sh "$PWD" "$PWD/config.json"
 
+      # ── ImageMagick(apply-icons.sh 用 magick/convert 生成 res/icon.ico 等各尺寸图标)──
+      #   照抄 rdgen 写法:装完把 ImageMagick 目录追加进 $GITHUB_PATH,供后续 Git Bash 步骤调用。
+      - name: Install ImageMagick
+        shell: pwsh
+        run: |
+          choco install -y imagemagick.app --no-progress
+          Get-ChildItem -Path "${env:ProgramFiles}" | % { $_.FullName } | Select-String -Pattern "[\\/]ImageMagick[^\\/]*$" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      # ── 注入自定义应用图标 / 首页 Logo(config.json 的 base64 → res/icon.* + flutter/assets/logo.svg)──
+      #   ★ 必须在 "Restore resources"(补齐上游默认图标)之后,自定义图标才能覆盖上游默认图标。
+      - name: Apply icons
+        shell: bash
+        run: |
+          set -e
+          bash /tmp/patch/apply-icons.sh "$PWD" "$PWD/config.json"
+
       # ── 生成 custom_.txt(base64(_custom_client.json);打包时放进 ./rustdesk 供客户端读取)──
       #   signMode=delete:apply-config 已删验签,直接 base64(json) 即可被客户端接受。
       #   signMode=swapkey:TODO(v1)加 SIGN_PRIVKEY 对 _custom_client.json 签名后再 base64。
@@ -284,6 +300,14 @@ jobs:
             exit 1
           fi
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+
+      # ── 据自定义 res/icon.png 重生成各平台 flutter 图标(pubspec flutter_icons.image_path=../res/icon.png)──
+      #   best-effort:装不上/跑不通不阻断构建(Rust 侧 res/icon.ico 已给 exe/托盘自定义图标)。
+      - name: Regenerate flutter icons
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd flutter && flutter pub get && (dart run flutter_launcher_icons || flutter pub run flutter_launcher_icons || true)
 
       # ── 核心编译:build.py 出 flutter runner Release + 附带 usbmmidd 虚拟显示器驱动 ──
       - name: Build rustdesk (cargo + flutter runner)
