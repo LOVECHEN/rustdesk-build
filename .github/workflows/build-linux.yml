@@ -487,7 +487,7 @@ jobs:
 
       #   archlinux:参照官方,仅 x86_64(x86 host 无法 makepkg arm64,且无最新 arm64 arch 镜像)。
       #   FLUTTER=1 makepkg 打包容器已产出的 flutter bundle(工作目录在 step 间保留)。
-      #   TODO(arm64+arch):官方也不在 CI 打 aarch64 arch 包;此组合会跳过打包(见下方 Collect 兜底)。
+      #   NOTE(arm64+arch):官方也不在 CI 打 aarch64 arch 包;此组合会跳过打包,由下方 Collect fail-fast 明确报错(不静默产坏链)。
       - name: Build archlinux package
         if: ${{ env.FORMAT == 'arch' && env.ARCH == 'x86_64' }}
         uses: rustdesk-org/arch-makepkg-action@04200739ed1d0bf6f2188b6736b26a767c57a7f9
@@ -520,7 +520,11 @@ jobs:
               cp "./flatpak/${N}-${A}.flatpak" dist/
               ;;
             arch)
-              cp ./res/*.pkg.tar.zst dist/ 2>/dev/null || cp ./res/*.zst dist/ 2>/dev/null || true
+              # arm64+arch:上游/CI 均无 aarch64 makepkg,archlinux 步已被 if 跳过 → 无 .zst 产物。
+              # 此处 fail-fast(而非 `|| true` 静默),让 build job 变红、notify 上报 status=error,
+              # 避免产出"只含 custom_.txt 的空 release + file_url 404"却回报 done 的坏链。
+              cp ./res/*.pkg.tar.zst dist/ 2>/dev/null || cp ./res/*.zst dist/ 2>/dev/null \
+                || { echo "::error::无 arch 包产出(arm64+arch 组合 CI 不支持 makepkg;请改用 x86_64 或换 deb/rpm 格式)"; exit 1; }
               ;;
           esac
           # custom_.txt 随包发布(客户端注入配置)
