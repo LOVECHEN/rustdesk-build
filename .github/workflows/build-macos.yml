@@ -333,7 +333,7 @@ jobs:
         shell: bash
         run: |
           cd flutter/build/macos/Build/Products/Release
-          if [ -d "RustDesk.app" ]; then
+          if [ -d "RustDesk.app" ] && [ "RustDesk.app" != "${{ env.appname }}.app" ]; then
             mv "RustDesk.app" "${{ env.appname }}.app"
             echo "RustDesk.app -> ${{ env.appname }}.app"
           fi
@@ -354,7 +354,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/flutter/build/macos/Build/Products/Release"
           echo "Directory contents:"
           ls -la
-          if [ -d "RustDesk.app" ]; then
+          if [ -d "RustDesk.app" ] && [ "RustDesk.app" != "${{ env.appname }}.app" ]; then
             mv "RustDesk.app" "${{ env.appname }}.app"
           fi
           if [ ! -d "${{ env.appname }}.app" ]; then
