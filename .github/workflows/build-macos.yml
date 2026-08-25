@@ -1,0 +1,386 @@
+name: build-custom-client-macos
+# Build a RustDesk client. Build inputs are provided at build time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      taskid:
+        description: '构建任务 id'
+        required: true
+        type: string
+      gen:
+        description: '(optional)'
+        required: false
+        type: string
+        default: ''
+      callback_url:
+        description: '(optional)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+# 上游 rustdesk mac CI 也用 1.81(1.78 有 i128 ABI 变更导致 sciter 崩)。bridge 生成用 1.75(见 bridge.yml,
+# 与主编译解耦,生成的只是源码)。FLUTTER 3.24.5 / frb 1.80.1 / vcpkg 120deac 与 linux 侧一致。
+env:
+  RUST_VERSION: "1.75"          # 参考(bridge.yml 自带 1.75;此处不直接用于 mac 主编译)
+  MAC_RUST_VERSION: "1.81"      # ★ mac 主编译工具链(照 rdgen generator-macos)
+  FLUTTER_VERSION: "3.24.5"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.4.9"
+  UPSTREAM_REF: "1.4.9"         # 补齐资源用的 pin 死上游 tag
+
+jobs:
+  # ── 先生成 flutter_rust_bridge(reusable workflow,复用与 linux 同一个 bridge.yml)──
+  #   bridge 的 upload 列表已含 ./flutter/macos/Runner/bridge_generated.h,mac 编译需要它。
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+    secrets: inherit
+    with:
+      version: '1.4.9'
+
+  # ── 主编译:macos x86_64 → .dmg ─────────────────────────────────────────────────────
+  build-for-macos:
+    needs: generate-bridge
+    name: build rustdesk macos ${{ matrix.job.arch }}
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0 只放 x86_64 一条(macos-15-intel = Intel runner)。aarch64 v1 再开(见下方注释)。
+        job:
+          - {
+              arch: x86_64,
+              target: x86_64-apple-darwin,
+              os: macos-15-intel,
+              vcpkg-triplet: x64-osx,
+              extra-build-args: "",
+            }
+          # - {
+          #     arch: aarch64,
+          #     target: aarch64-apple-darwin,
+          #     os: macos-14,
+          #     vcpkg-triplet: arm64-osx,
+          #     extra-build-args: "--screencapturekit",
+          #   }
+    outputs:
+      file_url: ${{ steps.release.outputs.file_url }}
+    steps:
+      # ════════════════════════════════════════════════════════════════════════════════
+      # 前半段 = 通用外壳(从 linux build.yml 逐字照搬,仅平台无关处不变)
+      # ════════════════════════════════════════════════════════════════════════════════
+
+      - name: Fetch build inputs
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
+          PRIV: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          set -e
+          B="https://x-access-token:${GH_TOKEN}@github.com/${PRIV}.git"
+          # 源码 → workspace 根(空目录,可直接 clone 进 .)
+          git clone --depth 1 -b code "$B" .
+          # patch / config → /tmp
+          git clone --depth 1 -b patch  "$B" /tmp/patch
+          git clone --depth 1 -b config "$B" /tmp/cfg
+          SUF=""; [ -n "${{ inputs.gen }}" ] && SUF="-${{ inputs.gen }}"
+          cp "/tmp/cfg/configs/${{ inputs.taskid }}${SUF}.json" ./config.json
+          # 敏感配置值加掩码:appName/host/key 及其派生,一律不进公开 CI 日志
+          for _v in "$(jq -r '.appName // empty' config.json)" "$(jq -r '.server.host // empty' config.json)" "$(jq -r '.server.key // empty' config.json)"; do
+            [ -n "$_v" ] && echo "::add-mask::$_v"
+          done
+
+      #   后续保留的平台专属改名步用 ${{ env.appname }} / ${{ env.compname }} / ${{ env.filename }}。
+      - name: Derive names from config.json
+        run: |
+          set -e
+          APP=$(jq -r '.appName // "RustDesk"' config.json)
+          COMP=$(jq -r '.companyName // "Purslane Ltd."' config.json)
+          SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=custom
+          {
+            echo "appname=$APP"
+            echo "compname=$COMP"
+            echo "filename=$SAFE"
+          } >> "$GITHUB_ENV"
+
+      #   真实 flutter mac 编译 + dmg 都要用到。--ignore-existing:本地已有一律保留,只补缺失。
+      - name: Restore resources
+        run: |
+          set -e
+          git clone --depth 1 --branch "${UPSTREAM_REF}" https://github.com/rustdesk/rustdesk.git /tmp/up
+          rsync -a --ignore-existing --exclude='.git' /tmp/up/ ./
+          rm -rf /tmp/up
+          echo "已补齐资源;抽查: $(ls -1 res/32x32.png flutter/assets/icon.svg .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff 2>&1 | tr '\n' ' ')"
+
+      #   apply-config 已注入 host/key/api/验签/appname/公司名/官网/下载链接/delayFix,并生成
+      #   ./_custom_client.json。SRC = workspace 根 = $PWD。
+      #   注:apply-config.sh 内部用 GNU 风格 `sed -i -e`,在 macOS BSD sed 下会正确改文件、仅额外留下
+      #   `<file>-e` 备份(.rs-e/.toml-e 不会被 cargo/flutter 编译,无害)。
+      - name: Apply configuration
+        run: |
+          set -e
+          chmod +x /tmp/patch/*.sh
+          /tmp/patch/apply-config.sh "$PWD" "$PWD/config.json"
+
+      #   macOS BSD base64 无 `-w0`,用 `base64 | tr -d '\n'` 便携写法。
+      #   signMode=swapkey 需配对私钥签名(TODO v1,需 SIGN_PRIVKEY);v0 先按未签处理。
+      - name: Generate config blob
+        run: |
+          set -e
+          MODE=$(jq -r '.signMode // "delete"' config.json)
+          if [ "$MODE" = "swapkey" ]; then
+            echo "::warning::signMode=swapkey 尚未实现签名(需 SIGN_PRIVKEY);v0 先按未签处理"
+          fi
+          base64 < ./_custom_client.json | tr -d '\n' > ./custom_.txt
+          echo "custom_.txt 生成: $(wc -c < ./custom_.txt) 字节"
+
+      # ── Restore bridge files(从 generate-bridge 的 bridge-artifact 下载还原,含 mac 头文件)──
+      #   放在 apply-config 之后:bridge 生成物(generated_bridge.dart / bridge_generated.rs /
+      #   flutter/macos/Runner/bridge_generated.h)不被 apply-config 触碰,还原后即为最终桥接源码。
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4   # 钉 v4(配 bridge 的 upload-artifact@v4)
+        with:
+          name: bridge-artifact
+          path: ./
+
+      # ════════════════════════════════════════════════════════════════════════════════
+      # ════════════════════════════════════════════════════════════════════════════════
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7   # ★ rdgen 用 @v6(已弃用),升 v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # ── ★保留:macOS 平台专属改名(Info.plist / AppInfo.xcconfig / pbxproj / CMakeLists)──
+      #   的 bundle 层改名。全部 `sed -i ''`(BSD 正确形式)。appname/compname 来自上面派生的 env。
+      - name: Update macOS Info.plist and settings
+        continue-on-error: false
+        shell: bash
+        run: |
+          # Info.plist
+          sed -i '' -e 's|<key>CFBundleName</key>.*<string>.*</string>|<key>CFBundleName</key>\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
+          sed -i '' -e 's|<key>CFBundleDisplayName</key>.*<string>.*</string>|<key>CFBundleDisplayName</key>\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
+          sed -i '' -e 's|<key>CFBundleIdentifier</key>.*<string>.*</string>|<key>CFBundleIdentifier</key>\n\t<string>com.${{ env.appname }}.app</string>|' ./flutter/macos/Runner/Info.plist
+
+          # AppInfo.xcconfig
+          sed -i '' -e 's|PRODUCT_NAME = .*|PRODUCT_NAME = ${{ env.appname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
+          sed -i '' -e 's|PRODUCT_BUNDLE_IDENTIFIER = .*|PRODUCT_BUNDLE_IDENTIFIER = com.${{ env.appname }}.app|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
+          sed -i '' -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
+          sed -i '' -e 's|Purslane Ltd.|${{ env.compname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
+
+          # Xcode project settings
+          sed -i '' -e 's/PRODUCT_NAME = "RustDesk"/PRODUCT_NAME = "${{ env.appname }}"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
+          sed -i '' -e 's/PRODUCT_BUNDLE_IDENTIFIER = ".*"/PRODUCT_BUNDLE_IDENTIFIER = "com.${{ env.appname }}.app"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
+
+          # CMake settings
+          if [ -f "./flutter/macos/CMakeLists.txt" ]; then
+            sed -i '' -e 's/set(BINARY_NAME ".*")/set(BINARY_NAME "${{ env.appname }}")/' ./flutter/macos/CMakeLists.txt
+          fi
+
+      - name: Install build runtime
+        run: |
+          brew install llvm create-dmg
+          # pkg-config 可能已被 runner 预装
+          if command -v pkg-config &>/dev/null; then
+            echo "pkg-config is already installed"
+          else
+            brew install pkg-config
+          fi
+
+      - name: Install NASM
+        run: |
+          # 从官方发行装 NASM 2.16.x。不要 `brew install nasm`(装的是 3.x,CLI 不兼容,
+          # aom 等多媒体库的 x86/x86_64 汇编需要 NASM 2.x)。
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      # ── ★保留:flutter 3.24.5 需要 dropdown_menu enableFilter 补丁(上游 rustdesk 自家 CI 也打)。
+      #   补丁文件由"资源补齐"从上游 1.4.9 补进了 ${{ github.workspace }}/.github/patches。
+      - name: Patch flutter
+        continue-on-error: true
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          # https://github.com/flutter/flutter/issues/133533
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ matrix.job.os }}
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+
+      - name: Create MacOS directory structure
+        run: |
+          mkdir -p ./build/macos/Build/Products/Release/RustDesk.app/Contents/MacOS
+
+      # ── ★保留:核心编译。aarch64 段只对 arm target 生效(x86_64 跳过,留待 v1);
+      #   build.py 的 RustDesk.app → "${appname}.app" 改名保留。extra-build-args 来自 matrix。
+      - name: Build rustdesk
+        run: |
+          if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
+            MIN_MACOS_VERSION="12.3"
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+            sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+          fi
+          sed -i -e "s/RustDesk.app/\"${{ env.appname }}.app\"/" build.py
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra-build-args }}
+
+      - name: Embed custom config into the .app bundle
+        shell: bash
+        run: |
+          APP=$(find ./flutter/build/macos/Build/Products/Release -maxdepth 1 -name "*.app" | head -n 1)
+          echo "App bundle: $APP"
+          cp ./custom_.txt "$APP/Contents/MacOS/custom_.txt"
+          ls -l "$APP/Contents/MacOS/custom_.txt"
+
+      # ── ★保留(去掉 if 门,恒执行):ad-hoc 签名 + RustDesk.app → ${appname}.app 改名。
+      #   不做 p12/rcodesign/notarize(缺 secret 会失败)。DMG 步依赖此处已完成改名。
+      - name: Ad-hoc Sign macOS app bundle
+        shell: bash
+        run: |
+          cd flutter/build/macos/Build/Products/Release
+          if [ -d "RustDesk.app" ]; then
+            mv "RustDesk.app" "${{ env.appname }}.app"
+            echo "RustDesk.app -> ${{ env.appname }}.app"
+          fi
+          TARGET_APP="${{ env.appname }}.app"
+          if [ -d "$TARGET_APP" ]; then
+            echo "清理扩展属性..."
+            xattr -cr "$TARGET_APP" || true
+            echo "ad-hoc 递归重签 $TARGET_APP ..."
+            codesign --force --deep --sign - "$TARGET_APP"
+            echo "ad-hoc 签名完成。"
+          else
+            echo "Error: 未找到 app bundle: $TARGET_APP"
+            exit 1
+          fi
+
+      - name: Create DMG
+        run: |
+          cd "$GITHUB_WORKSPACE/flutter/build/macos/Build/Products/Release"
+          echo "Directory contents:"
+          ls -la
+          if [ -d "RustDesk.app" ]; then
+            mv "RustDesk.app" "${{ env.appname }}.app"
+          fi
+          if [ ! -d "${{ env.appname }}.app" ]; then
+            echo "Could not find .app bundle!"
+            exit 1
+          fi
+          echo "Creating DMG for ${{ env.appname }}.app"
+          create-dmg \
+            --volname "${{ env.appname }}" \
+            --window-pos 200 120 \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --icon "${{ env.appname }}.app" 200 190 \
+            --hide-extension "${{ env.appname }}.app" \
+            --app-drop-link 600 185 \
+            "${{ env.appname }}-${{ matrix.job.arch }}.dmg" \
+            "${{ env.appname }}.app"
+          mv "${{ env.appname }}-${{ matrix.job.arch }}.dmg" "$GITHUB_WORKSPACE/"
+
+      # ── ★改(去掉 UPLOAD_ARTIFACT 门,恒执行):dmg 收敛成 filename-arch.dmg ──
+      - name: Rename dmg to filename
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          DMG_FILE=$(find . -maxdepth 1 -name "${{ env.appname }}-${{ matrix.job.arch }}.dmg" | head -n 1)
+          if [ -n "$DMG_FILE" ]; then
+            mv "$DMG_FILE" "${{ env.filename }}-${{ matrix.job.arch }}.dmg"
+            echo "Renamed to ${{ env.filename }}-${{ matrix.job.arch }}.dmg"
+          else
+            echo "No DMG file found matching the pattern"
+            exit 1
+          fi
+
+      # ── 收集产物(dmg + custom_.txt)────────────────────────────────────────────────
+      - name: Collect artifacts
+        run: |
+          set -e
+          mkdir -p dist
+          cp "$GITHUB_WORKSPACE/${{ env.filename }}-${{ matrix.job.arch }}.dmg" dist/
+          cp ./custom_.txt "dist/${{ env.filename }}-custom_.txt"
+          ls -l dist
+
+      - name: Publish Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}   # ★ 用 PAT(有本repo Contents:RW);github.token 默认只读发不了Release
+        run: |
+          set -e
+          SUF=""; [ -n "${{ inputs.gen }}" ] && SUF="-${{ inputs.gen }}"
+          TAG="build-${{ inputs.taskid }}${SUF}"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" dist/* \
+            --title "custom client ${{ inputs.taskid }}" \
+            --notes "自动构建 (macos ${{ matrix.job.arch }}, rustdesk ${VERSION})"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          echo "file_url=${BASE}/${{ env.filename }}-${{ matrix.job.arch }}.dmg" >> "$GITHUB_OUTPUT"
+
+  notify:
+    needs: [generate-bridge, build-for-macos]
+    if: ${{ always() && inputs.callback_url != '' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Notify
+        run: |
+          if [ "${{ needs.build-for-macos.result }}" = "success" ]; then
+            STATUS="done"
+            FILE="${{ needs.build-for-macos.outputs.file_url }}"
+          else
+            STATUS="error"
+            FILE=""
+          fi
+          echo "callback: status=$STATUS file=$FILE"
+          curl -s -X POST "${{ inputs.callback_url }}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"taskid\":\"${{ inputs.taskid }}\",\"gen\":\"${{ inputs.gen }}\",\"status\":\"${STATUS}\",\"file\":\"${FILE}\"}" || true

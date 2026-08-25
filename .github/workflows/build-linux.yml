@@ -1,0 +1,397 @@
+name: build-custom-client
+# Build a RustDesk client. Build inputs are provided at build time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      taskid:
+        description: '构建任务 id'
+        required: true
+        type: string
+      gen:
+        description: '(optional)'
+        required: false
+        type: string
+        default: ''
+      callback_url:
+        description: '(optional)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+# RUST 1.75 / FLUTTER 3.24.5 / VCPKG 120deac... / frb 1.80.1)。VERSION 固定 1.4.9(我们的源码版本)。
+env:
+  RUST_VERSION: "1.75"
+  FLUTTER_VERSION: "3.24.5"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.4.9"
+  UPSTREAM_REF: "1.4.9" # 补齐资源用的 pin 死上游 tag
+
+jobs:
+  # ── 先生成 flutter_rust_bridge(reusable workflow,见 ./.github/workflows/bridge.yml)──
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+    secrets: inherit
+    with:
+      version: '1.4.9'
+
+  # ── 主编译:linux x64 → .deb + AppImage ─────────────────────────────────────────────
+  build:
+    needs: generate-bridge
+    name: build rustdesk linux x86_64
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - {
+              arch: x86_64,
+              target: x86_64-unknown-linux-gnu,
+              distro: ubuntu18.04,
+              on: ubuntu-22.04,
+              deb_arch: amd64,
+              vcpkg-triplet: x64-linux,
+            }
+    outputs:
+      file_url: ${{ steps.release.outputs.file_url }}
+    steps:
+      #   patch/config clone 到 /tmp,避免被源码 clone 干扰。
+      - name: Fetch build inputs
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
+          PRIV: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          set -e
+          B="https://x-access-token:${GH_TOKEN}@github.com/${PRIV}.git"
+          # 源码 → workspace 根(空目录,可直接 clone 进 .)
+          git clone --depth 1 -b code "$B" .
+          # patch / config → /tmp
+          git clone --depth 1 -b patch  "$B" /tmp/patch
+          git clone --depth 1 -b config "$B" /tmp/cfg
+          SUF=""; [ -n "${{ inputs.gen }}" ] && SUF="-${{ inputs.gen }}"
+          cp "/tmp/cfg/configs/${{ inputs.taskid }}${SUF}.json" ./config.json
+          # 敏感配置值加掩码:appName/host/key 及其派生,一律不进公开 CI 日志
+          for _v in "$(jq -r '.appName // empty' config.json)" "$(jq -r '.server.host // empty' config.json)" "$(jq -r '.server.key // empty' config.json)"; do
+            [ -n "$_v" ] && echo "::add-mask::$_v"
+          done
+
+      #   xorg.conf 等;真实 flutter 编译 + deb + AppImage 都会用到,不补齐必然编译/打包失败。
+      - name: Restore resources
+        run: |
+          set -e
+          git clone --depth 1 --branch "${UPSTREAM_REF}" https://github.com/rustdesk/rustdesk.git /tmp/up
+          rsync -a --ignore-existing --exclude='.git' /tmp/up/ ./
+          rm -rf /tmp/up
+          echo "已补齐资源;抽查: $(ls -1 res/scalable.svg res/32x32.png flutter/assets/icon.svg 2>&1 | tr '\n' ' ')"
+
+      #   apply-config 已注入 host/key/api/appname/公司名/官网/下载链接/验签处理,并生成
+      #   ./_custom_client.json。SRC = workspace 根 = $PWD。
+      - name: Apply configuration
+        run: |
+          set -e
+          chmod +x /tmp/patch/*.sh
+          /tmp/patch/apply-config.sh "$PWD" "$PWD/config.json"
+
+      #   signMode=delete:apply-config 已删验签,直接 base64(json) 即可被客户端接受。
+      #   signMode=swapkey:apply-config 已把内置公钥换成自签公钥,custom_.txt 需**用配对私钥签名**——
+      #   TODO(v1):加 SIGN_PRIVKEY secret,对 _custom_client.json 签名后再 base64。
+      - name: Generate config blob
+        run: |
+          set -e
+          MODE=$(jq -r '.signMode // "delete"' config.json)
+          if [ "$MODE" = "swapkey" ]; then
+            echo "::warning::signMode=swapkey 尚未实现签名(需 SIGN_PRIVKEY);v0 先按未签处理"
+          fi
+          base64 -w0 ./_custom_client.json > ./custom_.txt
+          echo "custom_.txt 生成: $(wc -c < ./custom_.txt) 字节"
+
+      # ────────────────────────────────────────────────────────────────────────────────
+      # (去掉 icon/logo 下载、appname/compname/url/download sed、allowCustom、rpm/suse/arch 打包)。
+      # ────────────────────────────────────────────────────────────────────────────────
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7 # ★ rdgen 用 @v6(已弃用),升 v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get update -y
+          sudo apt-get install -y nasm
+          if [[ "${{ matrix.job.arch }}" == "x86_64" ]]; then
+            sudo apt-get install -y qemu-user-static
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick rsync
+
+      - name: Set Swap Space
+        if: ${{ matrix.job.arch == 'x86_64' }}
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 12
+
+      - name: Free Space
+        run: |
+          df -h
+          free -m
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+          components: "rustfmt"
+
+      - name: Save Rust toolchain version
+        run: |
+          RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')
+          echo "RUST_TOOLCHAIN_VERSION=$RUST_TOOLCHAIN_VERSION" >> $GITHUB_ENV
+
+      - name: Compute output filename from appName
+        run: |
+          APP=$(jq -r '.appName // "rustdesk"' config.json)
+          SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=custom
+          echo "FILENAME=$SAFE" >> $GITHUB_ENV
+          echo "output name set"
+
+      - name: Disable rust bridge build
+        run: |
+          sed -i "s/\[\"cdylib\", \"staticlib\", \"rlib\"\]/\[\"cdylib\"\]/g" Cargo.toml
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4 # ★ 钉 v4(配 bridge 的 upload-artifact@v4)
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          sudo apt install -y libva-dev && apt show libva-dev
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet ${{ matrix.job.vcpkg-triplet }} \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+        shell: bash
+
+      - name: Restore bridge files (again, as rdgen)
+        uses: actions/download-artifact@v4 # ★ 钉 v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      #     ★删 systemctl {app_name} 的 linux.rs sed(那是 appname 打包改名,v0 不做)
+      #     ★删 whitelabel(appname)块 + rpm/suse/arch 打包(v0 只要 deb+AppImage)
+      #     ★flutter 3.24.5 的 dropdown 补丁:改用容器内挂载路径 /workspace/.github/patches/...
+      #        .github/patches 从上游 1.4.9 补回源码根,故此路径可靠)
+      - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
+        name: Build rustdesk (cargo + flutter + deb)
+        id: build
+        with:
+          arch: ${{ matrix.job.arch }}
+          distro: ${{ matrix.job.distro }}
+          githubToken: ${{ github.token }}
+          setup: |
+            ls -l "${PWD}"
+            ls -l /opt/artifacts/vcpkg/installed
+          dockerRunArgs: |
+            --volume "${PWD}:/workspace"
+            --volume "/opt/artifacts:/opt/artifacts"
+          shell: /bin/bash
+          install: |
+            apt-get update -y
+            echo -e "installing deps"
+            apt-get install -y \
+               build-essential \
+               clang \
+               cmake \
+               curl \
+               gcc \
+               git \
+               g++ \
+               imagemagick \
+               libayatana-appindicator3-dev \
+               libasound2-dev \
+               libclang-10-dev \
+               libgstreamer1.0-dev \
+               libgstreamer-plugins-base1.0-dev \
+               libgtk-3-dev \
+               libpam0g-dev \
+               libpulse-dev \
+               libva-dev \
+               libxcb-randr0-dev \
+               libxcb-shape0-dev \
+               libxcb-xfixes0-dev \
+               libxdo-dev \
+               libxfixes-dev \
+               llvm-10-dev \
+               nasm \
+               ninja-build \
+               pkg-config \
+               tree \
+               python3 \
+               rpm \
+               unzip \
+               wget \
+               xz-utils \
+               libssl-dev
+            # we have libopus compiled by us.
+            apt-get remove -y libopus-dev || true
+            ls -l ./
+            tree -L 3 /opt/artifacts/vcpkg/installed
+          run: |
+            # disable git safe.directory
+            git config --global --add safe.directory "*"
+            pushd /opt
+            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}.tar.gz
+            tar -zxvf rust.tar.gz > /dev/null && rm rust.tar.gz
+            cd rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }} && ./install.sh
+            rm -rf rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}
+            # edit config
+            mkdir -p ~/.cargo/
+            echo """
+              [source.crates-io]
+              registry = 'https://github.com/rust-lang/crates.io-index'
+            """ > ~/.cargo/config
+            cat ~/.cargo/config
+            # start build
+            pushd /workspace
+            export VCPKG_ROOT=/opt/artifacts/vcpkg
+            if [[ "${{ matrix.job.arch }}" == "aarch64" ]]; then
+              export JOBS="--jobs 3"
+            else
+              export JOBS=""
+            fi
+            echo $JOBS
+
+            cargo build --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste --release
+            rm -rf target/release/deps target/release/build
+            rm -rf ~/.cargo
+
+            # Setup Flutter
+            git config --global --add safe.directory "*"
+            pushd /workspace
+            export PATH=/opt/flutter/bin:$PATH
+            popd
+            pushd /opt
+            wget https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            flutter doctor -v
+
+            # ★ flutter 3.24.5 需要 dropdown_menu enableFilter 补丁(上游 rustdesk 自家 CI 也打)。
+            #   用容器内挂载路径;补丁文件由"资源补齐"从上游 1.4.9 补进了 /workspace/.github/patches。
+            if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then
+              pushd /opt/flutter
+              if [ -f /workspace/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff ]; then
+                git apply /workspace/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff \
+                  || echo "::warning::dropdown 补丁 apply 失败/已应用,继续"
+              else
+                echo "::warning::未找到 dropdown 补丁,跳过(flutter 编译若因此失败见此处)"
+              fi
+              popd
+            fi
+
+            # build flutter
+            pushd /workspace
+            mkdir -p output
+            chmod 777 output -R
+            export CARGO_INCREMENTAL=0
+            export DEB_ARCH=${{ matrix.job.deb_arch }}
+            # 把 custom_.txt 烘焙进 deb(tmpdeb 会被 build.py 打进 /usr/share/rustdesk/)
+            mkdir -p flutter/tmpdeb/usr/share/rustdesk
+            cp ./custom_.txt ./flutter/tmpdeb/usr/share/rustdesk/custom_.txt
+
+            python3 ./build.py --flutter --skip-cargo
+            for name in *.deb; do
+              mv "$name" /workspace/output/"${{ env.FILENAME }}-${{ matrix.job.arch }}.deb"
+            done
+            ls -l /workspace/output/
+
+      #   AppImage recipe 硬编 rustdesk.deb / rustdesk 路径 / version 1.4.9,且引用 res/*.png +
+      #   res/scalable.svg(已由资源补齐补回),v0 不改名所以 recipe 原样可用。
+      - name: Build AppImage (x86_64)
+        run: |
+          set -e
+          cp "./output/${FILENAME}-${{ matrix.job.arch }}.deb" appimage/rustdesk.deb
+          sudo apt-get update -y
+          sudo apt-get install -y libarchive-tools libfuse2
+          sudo pip3 install "setuptools_scm<10"
+          sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
+          pushd appimage
+          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-${{ matrix.job.arch }}.yml
+          # recipe 产物是 <name>-<version>-<arch>.AppImage;用宽松 glob 收敛成我们的名字
+          sudo mv ./*.AppImage "./${FILENAME}-${{ matrix.job.arch }}.AppImage"
+          popd
+          ls -l appimage/*.AppImage
+
+      # ── 收集产物 + custom_.txt ──────────────────────────────────────────────────────
+      - name: Collect artifacts
+        run: |
+          set -e
+          mkdir -p dist
+          cp "./output/${FILENAME}-${{ matrix.job.arch }}.deb" dist/
+          cp "./appimage/${FILENAME}-${{ matrix.job.arch }}.AppImage" dist/
+          cp ./custom_.txt "dist/${FILENAME}-custom_.txt"
+          ls -l dist
+
+      - name: Publish Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}  # ★ 用 PAT(有本repo Contents:RW);github.token 默认只读发不了Release(404)
+        run: |
+          set -e
+          SUF=""; [ -n "${{ inputs.gen }}" ] && SUF="-${{ inputs.gen }}"
+          TAG="build-${{ inputs.taskid }}${SUF}"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" dist/* \
+            --title "custom client ${{ inputs.taskid }}" \
+            --notes "自动构建 (linux ${{ matrix.job.arch }}, rustdesk ${VERSION})"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          echo "file_url=${BASE}/${FILENAME}-${{ matrix.job.arch }}.deb" >> "$GITHUB_OUTPUT"
+
+  notify:
+    needs: [generate-bridge, build]
+    if: ${{ always() && inputs.callback_url != '' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Notify
+        run: |
+          if [ "${{ needs.build.result }}" = "success" ]; then
+            STATUS="done"
+            FILE="${{ needs.build.outputs.file_url }}"
+          else
+            STATUS="error"
+            FILE=""
+          fi
+          echo "callback: status=$STATUS file=$FILE"
+          curl -s -X POST "${{ inputs.callback_url }}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"taskid\":\"${{ inputs.taskid }}\",\"gen\":\"${{ inputs.gen }}\",\"status\":\"${STATUS}\",\"file\":\"${FILE}\"}" || true
