@@ -120,9 +120,10 @@ jobs:
           APP=$(jq -r '.appName // "RustDesk"' config.json)
           COMP=$(jq -r '.companyName // "Purslane Ltd."' config.json)
           SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=custom
-          # CFBundleIdentifier:config.json 有 packageName 就用它;为空才回退现状 com.<appname>.app
+          # CFBundleIdentifier:config.json 有 packageName 就用它;为空才回退 com.<safe-appname>.app。
+          #   回退用 $SAFE(已去空格/unicode);原始 $APP 含空格会生成非法 bundle id 破坏签名。
           PKG=$(jq -r '.packageName // empty' config.json)
-          if [ -n "$PKG" ]; then BID="$PKG"; else BID="com.${APP}.app"; fi
+          if [ -n "$PKG" ]; then BID="$PKG"; else BID="com.${SAFE}.app"; fi
           {
             echo "appname=$APP"
             echo "compname=$COMP"
