@@ -500,6 +500,14 @@ jobs:
       - name: Collect artifacts
         run: |
           set -e
+          # ★★ arch 真根因:makepkg-action(rustdesk/makepkg docker action)的 entrypoint 执行
+          #   `chown -R build /github/workspace`,把整个 workspace 属主改成容器 build 用户(uid2000)。
+          #   action 结束后 runner 用户(uid1001)再也无法写 workspace —— 连本步第一行 `mkdir dist`
+          #   都 Permission denied 而挂(此前 x86_64+arch 一直失败于此,与 res/ glob 无关)。
+          #   故 arch 时先把属主 chown 回 runner,后续 mkdir/cp/glob 全部恢复正常。
+          if [ "${{ env.FORMAT }}" = "arch" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" 2>/dev/null || true
+          fi
           mkdir -p dist
           F="${{ env.FORMAT }}"; A="${{ env.ARCH }}"; N="${FILENAME}"
           case "$F" in
@@ -520,18 +528,15 @@ jobs:
               cp "./flatpak/${N}-${A}.flatpak" dist/
               ;;
             arch)
-              # makepkg-action 在 rustdesk/makepkg 容器里以 build 用户产出到 res/(PKGEXT=.pkg.tar.zst),
-              # 其 entrypoint `chown -R build /github/workspace` 会把 res/ 改属主 → 宿主 runner 用户
-              # 无权列 res/,普通 glob(cp ./res/*.zst)展开失败。故用 sudo find 绕权限定位主包(排除
-              # -debug),sudo cp 出来再 chown 回 runner。arm64+arch 时 archlinux 步已被 if 跳过 → 无包,
-              # find 落空即 fail-fast(不静默产坏 release)。
-              PKG=$(sudo find "$PWD" -name 'rustdesk-*.pkg.tar.zst' ! -name '*-debug-*' 2>/dev/null | head -1)
+              # 属主已在本步开头 chown 回 runner。makepkg(PKGEXT=.pkg.tar.zst)在 res/ 同时产
+              # rustdesk 与 rustdesk-debug 两个包,收主包(排除 -debug),收敛成确定名。
+              # arm64+arch 时 archlinux 步已被 if 跳过 → res/ 无包,find 落空即 fail-fast(不静默产坏 release)。
+              PKG=$(find . -name 'rustdesk-*.pkg.tar.zst' ! -name '*-debug-*' | head -1)
               if [ -z "$PKG" ]; then
                 echo "::error::arch 包未找到(x86_64+arch 应由 makepkg 产出;arm64+arch CI 不支持)"
-                sudo find "$PWD" -name '*.pkg.tar*' 2>/dev/null | head; exit 1
+                find . -name '*.pkg.tar*'; exit 1
               fi
-              sudo cp "$PKG" "dist/${N}-${A}.pkg.tar.zst"
-              sudo chown "$(id -u):$(id -g)" "dist/${N}-${A}.pkg.tar.zst"
+              cp "$PKG" "dist/${N}-${A}.pkg.tar.zst"
               echo "arch 包收集: $PKG → dist/${N}-${A}.pkg.tar.zst"
               ;;
           esac
