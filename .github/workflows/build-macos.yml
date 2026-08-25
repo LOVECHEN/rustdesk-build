@@ -18,6 +18,29 @@ on:
         required: false
         type: string
         default: ''
+      # ── rdauth 给【所有平台】的 workflow 统一多传这 4 个 dispatch 输入(即使本平台用不到某个,
+      #   也必须在此声明,否则 dispatch 会 422 拒绝)。macOS 只实际消费 arch;distro(linux 包格式)、
+      #   package_format(android apk/aab)、msi(windows)在本 workflow 声明后忽略。──
+      arch:
+        description: 'CPU 架构:空/x64→x86_64(macos-15-intel);arm64→aarch64(macos-14)'
+        required: false
+        type: string
+        default: ''
+      distro:
+        description: '(linux only, ignored on macOS)'
+        required: false
+        type: string
+        default: ''
+      package_format:
+        description: '(android only, ignored on macOS)'
+        required: false
+        type: string
+        default: ''
+      msi:
+        description: "(windows only, ignored on macOS)"
+        required: false
+        type: string
+        default: 'false'
 
 permissions:
   contents: write
@@ -43,7 +66,12 @@ jobs:
     with:
       version: '1.4.9'
 
-  # ── 主编译:macos x86_64 → .dmg ─────────────────────────────────────────────────────
+  # ── 主编译:macos → .dmg。架构由 rdauth 的 dispatch 输入 `arch` 决定 ─────────────────
+  #   arch 空/'x64' → x86_64-apple-darwin,runs-on macos-15-intel(Intel runner);
+  #   arch 'arm64'  → aarch64-apple-darwin,runs-on macos-14(Apple Silicon),且编译加
+  #                   --screencapturekit(照官方:新 macOS 屏幕采集必需)。
+  #   matrix 单条动态项:所有字段由 ${{ inputs.arch }} 三元推导(strategy 上下文可用 inputs),
+  #   下游 ${{ matrix.job.* }} 引用一律不动,runs-on: ${{ matrix.job.os }} 即按 arch 选 runner。
   build-for-macos:
     needs: generate-bridge
     name: build rustdesk macos ${{ matrix.job.arch }}
@@ -51,22 +79,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v0 只放 x86_64 一条(macos-15-intel = Intel runner)。aarch64 v1 再开(见下方注释)。
         job:
           - {
-              arch: x86_64,
-              target: x86_64-apple-darwin,
-              os: macos-15-intel,
-              vcpkg-triplet: x64-osx,
-              extra-build-args: "",
+              arch: "${{ inputs.arch == 'arm64' && 'aarch64' || 'x86_64' }}",
+              target: "${{ inputs.arch == 'arm64' && 'aarch64-apple-darwin' || 'x86_64-apple-darwin' }}",
+              os: "${{ inputs.arch == 'arm64' && 'macos-14' || 'macos-15-intel' }}",
+              vcpkg-triplet: "${{ inputs.arch == 'arm64' && 'arm64-osx' || 'x64-osx' }}",
+              extra-build-args: "${{ inputs.arch == 'arm64' && '--screencapturekit' || '' }}",
             }
-          # - {
-          #     arch: aarch64,
-          #     target: aarch64-apple-darwin,
-          #     os: macos-14,
-          #     vcpkg-triplet: arm64-osx,
-          #     extra-build-args: "--screencapturekit",
-          #   }
     outputs:
       file_url: ${{ steps.release.outputs.file_url }}
     steps:
@@ -100,10 +120,14 @@ jobs:
           APP=$(jq -r '.appName // "RustDesk"' config.json)
           COMP=$(jq -r '.companyName // "Purslane Ltd."' config.json)
           SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=custom
+          # CFBundleIdentifier:config.json 有 packageName 就用它;为空才回退现状 com.<appname>.app
+          PKG=$(jq -r '.packageName // empty' config.json)
+          if [ -n "$PKG" ]; then BID="$PKG"; else BID="com.${APP}.app"; fi
           {
             echo "appname=$APP"
             echo "compname=$COMP"
             echo "filename=$SAFE"
+            echo "bundleid=$BID"
           } >> "$GITHUB_ENV"
 
       #   真实 flutter mac 编译 + dmg 都要用到。--ignore-existing:本地已有一律保留,只补缺失。
@@ -176,17 +200,17 @@ jobs:
           # Info.plist
           sed -i '' -e 's|<key>CFBundleName</key>.*<string>.*</string>|<key>CFBundleName</key>\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
           sed -i '' -e 's|<key>CFBundleDisplayName</key>.*<string>.*</string>|<key>CFBundleDisplayName</key>\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
-          sed -i '' -e 's|<key>CFBundleIdentifier</key>.*<string>.*</string>|<key>CFBundleIdentifier</key>\n\t<string>com.${{ env.appname }}.app</string>|' ./flutter/macos/Runner/Info.plist
+          sed -i '' -e 's|<key>CFBundleIdentifier</key>.*<string>.*</string>|<key>CFBundleIdentifier</key>\n\t<string>${{ env.bundleid }}</string>|' ./flutter/macos/Runner/Info.plist
 
           # AppInfo.xcconfig
           sed -i '' -e 's|PRODUCT_NAME = .*|PRODUCT_NAME = ${{ env.appname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
-          sed -i '' -e 's|PRODUCT_BUNDLE_IDENTIFIER = .*|PRODUCT_BUNDLE_IDENTIFIER = com.${{ env.appname }}.app|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
+          sed -i '' -e 's|PRODUCT_BUNDLE_IDENTIFIER = .*|PRODUCT_BUNDLE_IDENTIFIER = ${{ env.bundleid }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
           sed -i '' -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
           sed -i '' -e 's|Purslane Ltd.|${{ env.compname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
 
           # Xcode project settings
           sed -i '' -e 's/PRODUCT_NAME = "RustDesk"/PRODUCT_NAME = "${{ env.appname }}"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
-          sed -i '' -e 's/PRODUCT_BUNDLE_IDENTIFIER = ".*"/PRODUCT_BUNDLE_IDENTIFIER = "com.${{ env.appname }}.app"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
+          sed -i '' -e 's/PRODUCT_BUNDLE_IDENTIFIER = ".*"/PRODUCT_BUNDLE_IDENTIFIER = "${{ env.bundleid }}"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
 
           # CMake settings
           if [ -f "./flutter/macos/CMakeLists.txt" ]; then
