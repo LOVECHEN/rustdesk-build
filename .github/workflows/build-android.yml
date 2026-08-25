@@ -18,6 +18,30 @@ on:
         required: false
         type: string
         default: ''
+      # ── rdauth 给所有平台 workflow 统一派发下面 4 个 dispatch 输入;必须【全部声明】,
+      #    否则未声明的输入会让 workflow_dispatch 直接 422 拒绝。
+      #    android 只消费 arch / package_format;distro(linux 包格式)、msi(windows)
+      #    在 android 无意义,声明后忽略(仅为过 dispatch 校验)。
+      arch:
+        description: 'CPU arch: empty/aarch64/armv7/x86_64 (empty=aarch64)'
+        required: false
+        type: string
+        default: ''
+      distro:
+        description: '(linux only; ignored on android)'
+        required: false
+        type: string
+        default: ''
+      package_format:
+        description: 'android package: empty/apk/aab (empty=apk)'
+        required: false
+        type: string
+        default: ''
+      msi:
+        description: '(windows only; ignored on android)'
+        required: false
+        type: string
+        default: 'false'
 
 permissions:
   contents: write
@@ -43,26 +67,50 @@ jobs:
     with:
       version: '1.4.9'
 
-  # ── 主编译:android arm64 → .apk ────────────────────────────────────────────────────
+  # ── 主编译:android <arch> → .apk / .aab ───────────────────────────────────────────
+  #    arch/package_format 由 rdauth 通过 dispatch 传入;空值走 aarch64 + apk(向后兼容)。
   build:
     needs: generate-bridge
-    name: build rustdesk android ${{ matrix.job.arch }}
-    runs-on: ${{ matrix.job.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # v0 只放 aarch64 一条(--split-per-abi 出 arm64 apk);armv7/x86_64 v1 再加。
-        job:
-          - {
-              arch: aarch64,
-              target: aarch64-linux-android,
-              os: ubuntu-24.04,
-              reltype: release,
-              suffix: "",
-            }
+    name: build rustdesk android ${{ inputs.arch || 'aarch64' }}
+    runs-on: ubuntu-24.04
     outputs:
       file_url: ${{ steps.release.outputs.file_url }}
     steps:
+      # ── 把 inputs.arch / inputs.package_format 解析成一组 env,供后续所有步骤消费 ──
+      #    空 arch → aarch64;空/apk → apk;aab → appbundle。未知值直接 fail 掉。
+      #    ANDROID_ABI 同时就是 --split-per-abi 产物名里的 abi 段(arm64-v8a/armeabi-v7a/x86_64)。
+      - name: Resolve build params
+        shell: bash
+        run: |
+          set -e
+          case "${{ inputs.arch }}" in
+            ""|aarch64|arm64)
+              ARCH=aarch64;  RUST_TARGET=aarch64-linux-android;   ANDROID_ABI=arm64-v8a;   TARGET_PLATFORM=android-arm64; LIBCXX_TRIPLE=aarch64-linux-android; NDK_SCRIPT=ndk_arm64.sh ;;
+            armv7|arm|armeabi-v7a)
+              ARCH=armv7;    RUST_TARGET=armv7-linux-androideabi; ANDROID_ABI=armeabi-v7a; TARGET_PLATFORM=android-arm;   LIBCXX_TRIPLE=arm-linux-androideabi; NDK_SCRIPT=ndk_arm.sh ;;
+            x86_64|x64)
+              ARCH=x86_64;   RUST_TARGET=x86_64-linux-android;    ANDROID_ABI=x86_64;      TARGET_PLATFORM=android-x64;   LIBCXX_TRIPLE=x86_64-linux-android;  NDK_SCRIPT=ndk_x64.sh ;;
+            *)
+              echo "::error::unsupported arch '${{ inputs.arch }}' (expect empty/aarch64/armv7/x86_64)"; exit 1 ;;
+          esac
+          case "${{ inputs.package_format }}" in
+            ""|apk) PKG_FMT=apk; PKG_EXT=apk ;;
+            aab)    PKG_FMT=aab; PKG_EXT=aab ;;
+            *) echo "::error::unsupported package_format '${{ inputs.package_format }}' (expect empty/apk/aab)"; exit 1 ;;
+          esac
+          {
+            echo "ARCH=$ARCH"
+            echo "RUST_TARGET=$RUST_TARGET"
+            echo "ANDROID_ABI=$ANDROID_ABI"
+            echo "TARGET_PLATFORM=$TARGET_PLATFORM"
+            echo "LIBCXX_TRIPLE=$LIBCXX_TRIPLE"
+            echo "NDK_SCRIPT=$NDK_SCRIPT"
+            echo "PKG_FMT=$PKG_FMT"
+            echo "PKG_EXT=$PKG_EXT"
+            echo "RELTYPE=release"
+          } >> "$GITHUB_ENV"
+          echo "resolved: arch=$ARCH target=$RUST_TARGET abi=$ANDROID_ABI platform=$TARGET_PLATFORM fmt=$PKG_FMT"
+
       # ══════════════════════════════════════════════════════════════════════════════
       # 前半段 = 通用外壳,从 linux build.yml 逐字照搬(只改平台无关处)
       # ══════════════════════════════════════════════════════════════════════════════
@@ -300,20 +348,7 @@ jobs:
       - name: Install vcpkg dependencies
         shell: bash
         run: |
-          case ${{ matrix.job.target }} in
-            aarch64-linux-android)
-              ANDROID_TARGET=arm64-v8a
-            ;;
-            armv7-linux-androideabi)
-              ANDROID_TARGET=armeabi-v7a
-            ;;
-            x86_64-linux-android)
-              ANDROID_TARGET=x86_64
-            ;;
-            i686-linux-android)
-              ANDROID_TARGET=x86
-            ;;
-          esac
+          ANDROID_TARGET="${{ env.ANDROID_ABI }}"
           if ! ./flutter/build_android_deps.sh "${ANDROID_TARGET}"; then
             find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
               echo "$_1:"
@@ -329,31 +364,30 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          targets: ${{ matrix.job.target }}
+          targets: ${{ env.RUST_TARGET }}
           components: "rustfmt"
 
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: rustdesk-lib-cache-android
-          key: ${{ matrix.job.target }}
+          key: ${{ env.RUST_TARGET }}
 
+      #   按 inputs.arch 解析出的 NDK 脚本 / target / abi 编 native lib(参数化,不再写死 arm64)。
       - name: Build rustdesk lib
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          rustup target add ${{ matrix.job.target }}
+          rustup target add ${{ env.RUST_TARGET }}
           cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
-          case ${{ matrix.job.target }} in
-            aarch64-linux-android)
-              ./flutter/ndk_arm64.sh
-              mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
-            ;;
-          esac
+          ./flutter/${{ env.NDK_SCRIPT }}
+          mkdir -p ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}
+          cp ./target/${{ env.RUST_TARGET }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}/librustdesk.so
 
-      #   ★signingConfigs.release→debug:用 flutter 默认 debug keystore 出可安装 apk,
-      - name: Build rustdesk (apk)
+      #   ★signingConfigs.release→debug:用 flutter 默认 debug keystore 出可安装 apk;aab 同样 debug 签。
+      #   arch → --target-platform + libc++/rust .so 的 abi 目录 + apk 产物名的 abi 段,均由 env 解析。
+      #   package_format:apk → flutter build apk --split-per-abi;aab → flutter build appbundle。
+      - name: Build rustdesk (apk/aab)
         shell: bash
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -365,21 +399,24 @@ jobs:
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
           # 用 debug 签名配置(ad-hoc),避免依赖 keystore secret
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
-          case ${{ matrix.job.target }} in
-            aarch64-linux-android)
-              mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
-              cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
-              echo -n "${{ env.custom }}" | cat > ./flutter/assets/custom_.txt
-              pushd flutter
-              flutter build apk "--${{ matrix.job.reltype }}" --target-platform android-arm64 --split-per-abi
-              mv build/app/outputs/flutter-apk/app-arm64-v8a-${{ matrix.job.reltype }}.apk ../rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
-              popd
-            ;;
-          esac
-          # 收敛成我们的产物名 <filename>-<arch>.apk
+          # 该 abi 的 libc++_shared + rust native lib 放进 jniLibs
+          mkdir -p ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ env.LIBCXX_TRIPLE }}/libc++_shared.so ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}/
+          cp ./target/${{ env.RUST_TARGET }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}/librustdesk.so
+          echo -n "${{ env.custom }}" | cat > ./flutter/assets/custom_.txt
+          pushd flutter
+          if [ "${{ env.PKG_FMT }}" = "aab" ]; then
+            # appbundle 单 abi(jniLibs 里只放了这个 abi 的 .so);产物固定 app-<reltype>.aab
+            flutter build appbundle "--${{ env.RELTYPE }}" --target-platform ${{ env.TARGET_PLATFORM }}
+            mv build/app/outputs/bundle/${{ env.RELTYPE }}/app-${{ env.RELTYPE }}.aab ../rustdesk-${{ env.VERSION }}-${{ env.ARCH }}.aab
+          else
+            flutter build apk "--${{ env.RELTYPE }}" --target-platform ${{ env.TARGET_PLATFORM }} --split-per-abi
+            mv build/app/outputs/flutter-apk/app-${{ env.ANDROID_ABI }}-${{ env.RELTYPE }}.apk ../rustdesk-${{ env.VERSION }}-${{ env.ARCH }}.apk
+          fi
+          popd
+          # 收敛成我们的产物名 <filename>-<arch>.<ext>
           mkdir -p signed-apk
-          mv ./rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk ./signed-apk/${{ env.filename }}-${{ matrix.job.arch }}.apk
+          mv ./rustdesk-${{ env.VERSION }}-${{ env.ARCH }}.${{ env.PKG_EXT }} ./signed-apk/${{ env.filename }}-${{ env.ARCH }}.${{ env.PKG_EXT }}
           ls -l signed-apk
 
       # ── 收集产物 + custom_.txt ──────────────────────────────────────────────────────
@@ -387,11 +424,12 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          cp "./signed-apk/${{ env.filename }}-${{ matrix.job.arch }}.apk" dist/
+          cp "./signed-apk/${{ env.filename }}-${{ env.ARCH }}.${{ env.PKG_EXT }}" dist/
           cp ./custom_.txt "dist/${{ env.filename }}-custom_.txt"
           ls -l dist
 
       #   照抄 linux:用 PRIVATE_TOKEN(有本 repo Contents:RW);github.token 默认只读发不了 Release。
+      #   只发实际产出的那一个产物(apk 或 aab)+ custom_.txt;file_url 指向带 arch 后缀的产物名。
       - name: Publish Release
         id: release
         env:
@@ -403,9 +441,9 @@ jobs:
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" dist/* \
             --title "custom client ${{ inputs.taskid }}" \
-            --notes "自动构建 (android ${{ matrix.job.arch }}, rustdesk ${VERSION})"
+            --notes "自动构建 (android ${{ env.ARCH }} ${{ env.PKG_EXT }}, rustdesk ${VERSION})"
           BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
-          echo "file_url=${BASE}/${{ env.filename }}-${{ matrix.job.arch }}.apk" >> "$GITHUB_OUTPUT"
+          echo "file_url=${BASE}/${{ env.filename }}-${{ env.ARCH }}.${{ env.PKG_EXT }}" >> "$GITHUB_OUTPUT"
 
   notify:
     needs: [generate-bridge, build]
