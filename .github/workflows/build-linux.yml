@@ -18,6 +18,31 @@ on:
         required: false
         type: string
         default: ''
+      # ── rdauth 统一派发的 4 个新输入 ─────────────────────────────────────────────────
+      #   rdauth 给【所有】平台 workflow 都发这 4 个;缺声明会导致 dispatch 直接 422 拒绝,
+      #   所以即使本平台只用其中一部分,4 个也必须全部声明。
+      #   linux 侧实际消费:arch(架构) + distro(打包格式);
+      #   package_format(android apk/aab) / msi(windows) 在本平台声明但不使用。
+      arch:
+        description: 'CPU 架构: 空/x64 → x86_64;arm64 → aarch64'
+        required: false
+        type: string
+        default: ''
+      distro:
+        description: 'linux 打包格式: 空/debian → deb+AppImage;fedora → rpm;suse → suse rpm;arch → pkg.tar.zst;appimage → AppImage;flatpak → flatpak'
+        required: false
+        type: string
+        default: ''
+      package_format:
+        description: '(android apk/aab;linux 未使用)'
+        required: false
+        type: string
+        default: ''
+      msi:
+        description: "(windows msi 'true'/'false';linux 未使用)"
+        required: false
+        type: string
+        default: 'false'
 
 permissions:
   contents: write
@@ -40,23 +65,24 @@ jobs:
     with:
       version: '1.4.9'
 
-  # ── 主编译:linux x64 → .deb + AppImage ─────────────────────────────────────────────
+  # ── 主编译:linux → 按 arch(x86_64/aarch64) × distro(deb/rpm/suse/arch/appimage/flatpak)派发 ──
   build:
     needs: generate-bridge
-    name: build rustdesk linux x86_64
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        job:
-          - {
-              arch: x86_64,
-              target: x86_64-unknown-linux-gnu,
-              distro: ubuntu18.04,
-              on: ubuntu-22.04,
-              deb_arch: amd64,
-              vcpkg-triplet: x64-linux,
-            }
+    name: build rustdesk linux
+    #   arm64 走 GitHub 原生 arm runner(避免 x86 host 上 qemu 模拟 rust 编译直接超时);
+    #   x64 保持 ubuntu-22.04 原状,与之前跑通的配置逐字一致。
+    #   ★首次 CI 风险:私有仓库/组织若未开通 arm runner,arm64 任务会拿不到 runner 而排队/失败;
+    #    x64 完全不受影响(runs-on 及所有分支都按 ARCH 门控)。
+    runs-on: ${{ (inputs.arch == 'arm64' || inputs.arch == 'aarch64') && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    #   由 inputs 归一出的架构/格式参数,供各 step 用 ${{ env.* }} 消费(空值 → 现状 x86_64 + deb)。
+    env:
+      ARCH: ${{ (inputs.arch == 'arm64' || inputs.arch == 'aarch64') && 'aarch64' || 'x86_64' }}
+      TARGET: ${{ (inputs.arch == 'arm64' || inputs.arch == 'aarch64') && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
+      DEB_ARCH: ${{ (inputs.arch == 'arm64' || inputs.arch == 'aarch64') && 'arm64' || 'amd64' }}
+      VCPKG_TRIPLET: ${{ (inputs.arch == 'arm64' || inputs.arch == 'aarch64') && 'arm64-linux' || 'x64-linux' }}
+      BUILD_DISTRO: ubuntu18.04
+      #   空/debian → deb(默认另打 AppImage);其余原样透传(fedora/suse/arch/appimage/flatpak)。
+      FORMAT: ${{ (inputs.distro == '' || inputs.distro == 'debian') && 'deb' || inputs.distro }}
     outputs:
       file_url: ${{ steps.release.outputs.file_url }}
     steps:
@@ -126,7 +152,7 @@ jobs:
           echo "custom_.txt 生成: $(wc -c < ./custom_.txt) 字节"
 
       # ────────────────────────────────────────────────────────────────────────────────
-      # (去掉 icon/logo 下载、appname/compname/url/download sed、allowCustom、rpm/suse/arch 打包)。
+      # (去掉 icon/logo 下载、appname/compname/url/download sed、allowCustom 等 whitelabel 逻辑)。
       # ────────────────────────────────────────────────────────────────────────────────
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v7 # ★ rdgen 用 @v6(已弃用),升 v7
@@ -142,7 +168,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo apt-get update -y
           sudo apt-get install -y nasm
-          if [[ "${{ matrix.job.arch }}" == "x86_64" ]]; then
+          if [[ "${{ env.ARCH }}" == "x86_64" ]]; then
             sudo apt-get install -y qemu-user-static
           fi
 
@@ -152,7 +178,7 @@ jobs:
           sudo apt-get install -y imagemagick rsync
 
       - name: Set Swap Space
-        if: ${{ matrix.job.arch == 'x86_64' }}
+        if: ${{ env.ARCH == 'x86_64' }}
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 12
@@ -166,7 +192,7 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          targets: ${{ matrix.job.target }}
+          targets: ${{ env.TARGET }}
           components: "rustfmt"
 
       - name: Save Rust toolchain version
@@ -203,7 +229,7 @@ jobs:
           sudo apt install -y libva-dev && apt show libva-dev
           if ! $VCPKG_ROOT/vcpkg \
             install \
-            --triplet ${{ matrix.job.vcpkg-triplet }} \
+            --triplet ${{ env.VCPKG_TRIPLET }} \
             --x-install-root="$VCPKG_ROOT/installed"; then
             find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
               echo "$_1:"
@@ -214,7 +240,7 @@ jobs:
             done
             exit 1
           fi
-          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ env.VCPKG_TRIPLET }}-rel-out.log" || true
         shell: bash
 
       - name: Restore bridge files (again, as rdgen)
@@ -223,16 +249,16 @@ jobs:
           name: bridge-artifact
           path: ./
 
-      #     ★删 systemctl {app_name} 的 linux.rs sed(那是 appname 打包改名,v0 不做)
-      #     ★删 whitelabel(appname)块 + rpm/suse/arch 打包(v0 只要 deb+AppImage)
       #     ★flutter 3.24.5 的 dropdown 补丁:改用容器内挂载路径 /workspace/.github/patches/...
       #        .github/patches 从上游 1.4.9 补回源码根,故此路径可靠)
+      #     ★aarch64:参照官方,flutter 换成 sony/flutter-elinux;build.py 改用 flutter-elinux
+      #        命令 + arm64 产物路径。x86_64 保持官方 flutter 原状。
       - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
-        name: Build rustdesk (cargo + flutter + deb)
+        name: Build rustdesk (cargo + flutter + deb[/rpm/suse])
         id: build
         with:
-          arch: ${{ matrix.job.arch }}
-          distro: ${{ matrix.job.distro }}
+          arch: ${{ env.ARCH }}
+          distro: ${{ env.BUILD_DISTRO }}
           githubToken: ${{ github.token }}
           setup: |
             ls -l "${PWD}"
@@ -286,10 +312,10 @@ jobs:
             # disable git safe.directory
             git config --global --add safe.directory "*"
             pushd /opt
-            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}.tar.gz
+            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ env.TARGET }}.tar.gz
             tar -zxvf rust.tar.gz > /dev/null && rm rust.tar.gz
-            cd rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }} && ./install.sh
-            rm -rf rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}
+            cd rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ env.TARGET }} && ./install.sh
+            rm -rf rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ env.TARGET }}
             # edit config
             mkdir -p ~/.cargo/
             echo """
@@ -300,7 +326,7 @@ jobs:
             # start build
             pushd /workspace
             export VCPKG_ROOT=/opt/artifacts/vcpkg
-            if [[ "${{ matrix.job.arch }}" == "aarch64" ]]; then
+            if [[ "${{ env.ARCH }}" == "aarch64" ]]; then
               export JOBS="--jobs 3"
             else
               export JOBS=""
@@ -311,78 +337,190 @@ jobs:
             rm -rf target/release/deps target/release/build
             rm -rf ~/.cargo
 
-            # Setup Flutter
+            # ── Setup Flutter ──────────────────────────────────────────────────────────
+            #   x86_64: 官方 flutter;aarch64: sony/flutter-elinux(官方 Dart SDK 在 arm64 linux 不可用)。
             git config --global --add safe.directory "*"
             pushd /workspace
-            export PATH=/opt/flutter/bin:$PATH
+            case ${{ env.ARCH }} in
+              aarch64)
+                export PATH=/opt/flutter-elinux/bin:$PATH
+                # build.py 换用 flutter-elinux 命令,产物路径 x64→arm64
+                sed -i "s/flutter build linux --release/flutter-elinux build linux --verbose/g" ./build.py
+                sed -i "s/x64\/release/arm64\/release/g" ./build.py
+              ;;
+              x86_64)
+                export PATH=/opt/flutter/bin:$PATH
+              ;;
+            esac
             popd
             pushd /opt
             wget https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
             tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
-            flutter doctor -v
+            case ${{ env.ARCH }} in
+              aarch64)
+                # clone flutter-elinux 并 reset 到与 FLUTTER_VERSION 对齐的 tag
+                git clone https://github.com/sony/flutter-elinux.git || true
+                pushd flutter-elinux
+                  git fetch
+                  git reset --hard ${{ env.FLUTTER_VERSION }}
+                  bin/flutter-elinux doctor -v
+                  bin/flutter-elinux precache --linux
+                popd
+                # ★finicky:从 x64 flutter 缓存拷 shader_lib 给 arm64 引擎(官方同款做法)。
+                #  若 /opt/flutter 未预缓存导致 linux-x64/shader_lib 缺失,这里会报错——首次 CI 关注点。
+                cp -R flutter/bin/cache/artifacts/engine/linux-x64/shader_lib flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64
+                rm -rf flutter
+              ;;
+              x86_64)
+                flutter doctor -v
+              ;;
+            esac
 
             # ★ flutter 3.24.5 需要 dropdown_menu enableFilter 补丁(上游 rustdesk 自家 CI 也打)。
-            #   用容器内挂载路径;补丁文件由"资源补齐"从上游 1.4.9 补进了 /workspace/.github/patches。
+            #   补丁文件由"资源补齐"从上游 1.4.9 补进了 /workspace/.github/patches。
             if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then
-              pushd /opt/flutter
+              case ${{ env.ARCH }} in
+                aarch64) FL_DIR=/opt/flutter-elinux/flutter ;;
+                x86_64)  FL_DIR=/opt/flutter ;;
+              esac
               if [ -f /workspace/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff ]; then
+                pushd "$FL_DIR"
                 git apply /workspace/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff \
                   || echo "::warning::dropdown 补丁 apply 失败/已应用,继续"
+                popd
               else
                 echo "::warning::未找到 dropdown 补丁,跳过(flutter 编译若因此失败见此处)"
               fi
-              popd
             fi
 
-            # ★ 重生成 flutter 各平台图标:apply-icons 已把 res/icon.png(pubspec
-            #   flutter_icons.image_path=../res/icon.png)换成自定义图标,据此重生成
-            #   windows runner / macOS AppIcon.appiconset / android mipmap 各平台 flutter 图标。
-            #   best-effort,失败不阻断(linux 侧图标已由 res/*.png 覆盖,Rust 侧 res/icon.ico 给了 exe/托盘)。
+            # ★ 重生成 flutter 各平台图标:apply-icons 已把 res/icon.png 换成自定义图标。
+            #   best-effort,失败不阻断(linux 侧图标已由 res/*.png 覆盖;aarch64 下 flutter 命令
+            #   可能不在 PATH,直接跳过也没关系)。
             pushd /workspace/flutter
-            flutter pub get && (dart run flutter_launcher_icons || flutter pub run flutter_launcher_icons || true)
+            (flutter pub get && (dart run flutter_launcher_icons || flutter pub run flutter_launcher_icons)) \
+              || echo "::warning::flutter 图标重生成已跳过(linux 图标由 res/*.png 覆盖)"
             popd
 
-            # build flutter
+            # ── build flutter → .deb ────────────────────────────────────────────────────
             pushd /workspace
             mkdir -p output
             chmod 777 output -R
             export CARGO_INCREMENTAL=0
-            export DEB_ARCH=${{ matrix.job.deb_arch }}
+            export DEB_ARCH=${{ env.DEB_ARCH }}
             # 把 custom_.txt 烘焙进 deb(tmpdeb 会被 build.py 打进 /usr/share/rustdesk/)
             mkdir -p flutter/tmpdeb/usr/share/rustdesk
             cp ./custom_.txt ./flutter/tmpdeb/usr/share/rustdesk/custom_.txt
 
             python3 ./build.py --flutter --skip-cargo
             for name in *.deb; do
-              mv "$name" /workspace/output/"${{ env.FILENAME }}-${{ matrix.job.arch }}.deb"
+              mv "$name" /workspace/output/"${{ env.FILENAME }}-${{ env.ARCH }}.deb"
             done
             ls -l /workspace/output/
 
-      #   AppImage recipe 硬编 rustdesk.deb / rustdesk 路径 / version 1.4.9,且引用 res/*.png +
-      #   res/scalable.svg(已由资源补齐补回),v0 不改名所以 recipe 原样可用。
-      - name: Build AppImage (x86_64)
+            # ── 按 FORMAT 在容器内追加 rpm / suse rpm(rpm 已在 install 步装好)──────────────
+            #   NOTE: custom_.txt 目前仅经 tmpdeb 烘焙进 deb(appimage/flatpak 由 deb 派生故也含);
+            #   rpm/suse/arch 走 flutter bundle 打包,暂未注入 custom_.txt —— 若这些格式也要内置
+            #   custom_.txt,需另把它拷进 spec 引用的 bundle 目录(TODO)。
+            FMT="${{ env.FORMAT }}"
+            if [ "$FMT" = "fedora" ]; then
+              echo "start packaging fedora rpm"
+              if [ "${{ env.ARCH }}" = "aarch64" ]; then sed -i "s#linux/x64#linux/arm64#g" ./res/rpm-flutter.spec; fi
+              HBB=`pwd` rpmbuild ./res/rpm-flutter.spec -bb
+              for name in ~/rpmbuild/RPMS/${{ env.ARCH }}/rustdesk*.rpm; do
+                cp "$name" /workspace/output/"${{ env.FILENAME }}-${{ env.ARCH }}.rpm"
+              done
+            fi
+            if [ "$FMT" = "suse" ]; then
+              echo "start packaging suse rpm"
+              if [ "${{ env.ARCH }}" = "aarch64" ]; then sed -i "s#linux/x64#linux/arm64#g" ./res/rpm-flutter-suse.spec; fi
+              HBB=`pwd` rpmbuild ./res/rpm-flutter-suse.spec -bb
+              for name in ~/rpmbuild/RPMS/${{ env.ARCH }}/rustdesk*.rpm; do
+                cp "$name" /workspace/output/"${{ env.FILENAME }}-${{ env.ARCH }}-suse.rpm"
+              done
+            fi
+
+      #   AppImage recipe 引用 res/*.png + res/scalable.svg(已由资源补齐补回)。
+      #   默认(deb)与显式 appimage 时构建;从容器产出的 .deb 派生(故内含 custom_.txt)。
+      - name: Build AppImage
+        if: ${{ env.FORMAT == 'deb' || env.FORMAT == 'appimage' }}
         run: |
           set -e
-          cp "./output/${FILENAME}-${{ matrix.job.arch }}.deb" appimage/rustdesk.deb
+          cp "./output/${FILENAME}-${{ env.ARCH }}.deb" appimage/rustdesk.deb
           sudo apt-get update -y
           sudo apt-get install -y libarchive-tools libfuse2
           sudo pip3 install "setuptools_scm<10"
           sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
           pushd appimage
-          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-${{ matrix.job.arch }}.yml
+          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-${{ env.ARCH }}.yml
           # recipe 产物是 <name>-<version>-<arch>.AppImage;用宽松 glob 收敛成我们的名字
-          sudo mv ./*.AppImage "./${FILENAME}-${{ matrix.job.arch }}.AppImage"
+          sudo mv ./*.AppImage "./${FILENAME}-${{ env.ARCH }}.AppImage"
           popd
           ls -l appimage/*.AppImage
 
-      # ── 收集产物 + custom_.txt ──────────────────────────────────────────────────────
+      #   flatpak:参照官方,在 ubuntu22.04 容器里从 .deb 派生 flatpak bundle(故也内含 custom_.txt)。
+      - name: Build flatpak
+        if: ${{ env.FORMAT == 'flatpak' }}
+        uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
+        with:
+          arch: ${{ env.ARCH }}
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          dockerRunArgs: |
+            --volume "${PWD}:/workspace"
+          shell: /bin/bash
+          install: |
+            apt-get update -y
+            apt-get install -y git flatpak flatpak-builder
+          run: |
+            git config --global --add safe.directory "*"
+            pushd /workspace
+            cp "./output/${{ env.FILENAME }}-${{ env.ARCH }}.deb" flatpak/rustdesk.deb
+            pushd flatpak
+            git clone https://github.com/flathub/shared-modules.git --depth=1 || true
+            flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+            flatpak-builder --user --install-deps-from=flathub -y --force-clean --repo=repo ./build ./rustdesk.json
+            flatpak build-bundle ./repo "${{ env.FILENAME }}-${{ env.ARCH }}.flatpak" com.rustdesk.RustDesk
+
+      #   archlinux:参照官方,仅 x86_64(x86 host 无法 makepkg arm64,且无最新 arm64 arch 镜像)。
+      #   FLUTTER=1 makepkg 打包容器已产出的 flutter bundle(工作目录在 step 间保留)。
+      #   TODO(arm64+arch):官方也不在 CI 打 aarch64 arch 包;此组合会跳过打包(见下方 Collect 兜底)。
+      - name: Build archlinux package
+        if: ${{ env.FORMAT == 'arch' && env.ARCH == 'x86_64' }}
+        uses: rustdesk-org/arch-makepkg-action@04200739ed1d0bf6f2188b6736b26a767c57a7f9
+        with:
+          packages:
+          scripts: |
+            cd res && HBB=`pwd`/.. FLUTTER=1 makepkg -f
+
+      # ── 收集产物 + custom_.txt(按 FORMAT 只收实际产出的包)────────────────────────────
       - name: Collect artifacts
         run: |
           set -e
           mkdir -p dist
-          cp "./output/${FILENAME}-${{ matrix.job.arch }}.deb" dist/
-          cp "./appimage/${FILENAME}-${{ matrix.job.arch }}.AppImage" dist/
-          cp ./custom_.txt "dist/${FILENAME}-custom_.txt"
+          F="${{ env.FORMAT }}"; A="${{ env.ARCH }}"; N="${FILENAME}"
+          case "$F" in
+            deb)
+              cp "./output/${N}-${A}.deb" dist/
+              [ -f "./appimage/${N}-${A}.AppImage" ] && cp "./appimage/${N}-${A}.AppImage" dist/ || true
+              ;;
+            appimage)
+              cp "./appimage/${N}-${A}.AppImage" dist/
+              ;;
+            fedora)
+              cp "./output/${N}-${A}.rpm" dist/
+              ;;
+            suse)
+              cp "./output/${N}-${A}-suse.rpm" dist/
+              ;;
+            flatpak)
+              cp "./flatpak/${N}-${A}.flatpak" dist/
+              ;;
+            arch)
+              cp ./res/*.pkg.tar.zst dist/ 2>/dev/null || cp ./res/*.zst dist/ 2>/dev/null || true
+              ;;
+          esac
+          # custom_.txt 随包发布(客户端注入配置)
+          cp ./custom_.txt "dist/${N}-custom_.txt"
           ls -l dist
 
       - name: Publish Release
@@ -396,9 +534,18 @@ jobs:
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" dist/* \
             --title "custom client ${{ inputs.taskid }}" \
-            --notes "自动构建 (linux ${{ matrix.job.arch }}, rustdesk ${VERSION})"
+            --notes "自动构建 (linux ${{ env.ARCH }} / ${{ env.FORMAT }}, rustdesk ${VERSION})"
           BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
-          echo "file_url=${BASE}/${FILENAME}-${{ matrix.job.arch }}.deb" >> "$GITHUB_OUTPUT"
+          # 回调 file_url 指向该 FORMAT 的主产物
+          case "${{ env.FORMAT }}" in
+            fedora)   PRIMARY="${FILENAME}-${{ env.ARCH }}.rpm";;
+            suse)     PRIMARY="${FILENAME}-${{ env.ARCH }}-suse.rpm";;
+            appimage) PRIMARY="${FILENAME}-${{ env.ARCH }}.AppImage";;
+            flatpak)  PRIMARY="${FILENAME}-${{ env.ARCH }}.flatpak";;
+            arch)     PRIMARY=$(cd dist && ls *.zst 2>/dev/null | head -1);;
+            *)        PRIMARY="${FILENAME}-${{ env.ARCH }}.deb";;
+          esac
+          echo "file_url=${BASE}/${PRIMARY}" >> "$GITHUB_OUTPUT"
 
   notify:
     needs: [generate-bridge, build]
